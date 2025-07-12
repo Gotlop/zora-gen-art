@@ -1,5 +1,5 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { createCanvas, loadImage, registerFont } from "canvas";
+import { createCanvas, loadImage } from "canvas";
 import path from "path";
 import { fetchFirstMintedArtwork } from "../utils/fetchFirstMinted";
 
@@ -10,7 +10,6 @@ type BaseParams = {
   useOldest?: string;
 };
 
-//wallet age image generator
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
     const { address } = req.query as BaseParams;
@@ -21,16 +20,51 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         .json({ error: "Valid Ethereum address is required" });
     }
 
-    // Register custom font
-    const fontPath = path.join(process.cwd(), "public", "satoshi.ttf");
-    registerFont(fontPath, { family: "satoshi" });
-
     // Load template image
     const templatePath = path.join(process.cwd(), "public", "template.png");
     const templateImage = await loadImage(templatePath);
 
-    // Fetch first minted artwork
-    const firstMintedArtwork = await fetchFirstMintedArtwork(address);
+    // Fetch first minted artwork with retry logic
+    let firstMintedArtwork;
+    try {
+      firstMintedArtwork = await fetchFirstMintedArtwork(address);
+    } catch (error: any) {
+      // Handle specific error types
+      if (
+        error.message.includes("Rate limit exceeded") ||
+        error.message.includes("429") ||
+        (error.response && error.response.status === 429)
+      ) {
+        res.setHeader("Retry-After", "60");
+        res.setHeader(
+          "X-RateLimit-Reset",
+          new Date(Date.now() + 60000).toISOString()
+        );
+        return res.status(429).json({
+          error: "Rate limit exceeded. Please try again later.",
+          retryAfter: 60, // Suggest retry after 1 minute
+          message:
+            "Too many requests to external API. Please wait before retrying.",
+        });
+      }
+
+      if (error.message.includes("Invalid address")) {
+        return res.status(400).json({
+          error: "Invalid Ethereum address provided",
+          message: "Please provide a valid Ethereum address in 0x format.",
+        });
+      }
+
+      // For other API errors, return 503 (Service Unavailable)
+      console.error("API Error:", error);
+      res.setHeader("Retry-After", "30");
+      return res.status(503).json({
+        error:
+          "External API service temporarily unavailable. Please try again later.",
+        message:
+          "The external API is currently experiencing issues. Please retry in 30 seconds.",
+      });
+    }
 
     // Create canvas with template dimensions
     const canvas = createCanvas(templateImage.width, templateImage.height);
@@ -45,7 +79,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     if (firstMintedArtwork && firstMintedArtwork.downloadableUri) {
       try {
-        // Load the artwork image
         artworkImage = await loadImage(firstMintedArtwork.downloadableUri);
       } catch (artworkError) {
         console.error("Error loading artwork image:", artworkError);
@@ -63,7 +96,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         );
       } catch (placeholderError) {
         console.error("Error loading placeholder image:", placeholderError);
-        // If placeholder also fails, continue without any image
       }
     }
 
@@ -103,9 +135,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const buffer = canvas.toBuffer("image/png");
     res.setHeader("Content-Type", "image/png");
     res.setHeader("Cache-Control", "public, max-age=300"); // Cache for 5 minutes
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("X-Frame-Options", "DENY");
     res.send(buffer);
   } catch (error) {
     console.error("Error processing request:", error);
-    return res.status(500).json({ error: "Internal server error" });
+    return res.status(500).json({
+      error: "Internal server error",
+      message: "An unexpected error occurred while processing your request.",
+    });
   }
 }
